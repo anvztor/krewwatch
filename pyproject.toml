@@ -1,0 +1,30 @@
+[project]
+name = "krewwatch"
+version = "0.1.0"
+description = "Standalone SSE watch clients for the Krew ecosystem"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.8.0",
+    "starlette>=0.27.0",
+    "uvicorn>=0.34.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
