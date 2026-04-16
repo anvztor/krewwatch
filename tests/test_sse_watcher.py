@@ -271,3 +271,112 @@ class TestSSEWatcherLifecycle:
 
         await watcher.stop()
         assert watcher._running is False
+
+
+class TestTokenReloader:
+    """The watcher should recover from 401s when a fresh token is on disk."""
+
+    async def test_poll_401_triggers_reload_and_retry(self, fake_hub):
+        hub, base_url = fake_hub
+        hub.required_token = "new-token"
+
+        received = []
+
+        async def on_invocation(payload: dict) -> dict | None:
+            received.append(payload)
+            return {"text": "ok"}
+
+        hub.add_pending("alice", "coder", {
+            "invocation_id": "inv-401-1",
+            "method": "tasks/send",
+            "params": {"message": {"parts": [{"text": "hello"}]}},
+        })
+
+        # Reloader simulates ~/.krewcli/token being rotated from disk.
+        tokens = iter(["new-token"])
+        reloader_calls = []
+
+        def reloader() -> str | None:
+            reloader_calls.append(1)
+            try:
+                return next(tokens)
+            except StopIteration:
+                return None
+
+        watcher = SSEWatcher(
+            krewhub_url=base_url,
+            jwt_token="stale-token",
+            owner="alice",
+            agent_names=["coder"],
+            on_invocation=on_invocation,
+            token_reloader=reloader,
+        )
+
+        await watcher.poll_pending()
+
+        assert hub.unauthorized_hits == 1, "first request should have been a 401"
+        assert len(reloader_calls) == 1, "reloader should be invoked exactly once"
+        assert watcher._jwt_token == "new-token"
+        assert len(received) == 1
+        assert received[0]["id"] == "inv-401-1"
+
+    async def test_poll_401_without_reloader_does_not_recover(self, fake_hub):
+        hub, base_url = fake_hub
+        hub.required_token = "new-token"
+
+        received = []
+
+        async def on_invocation(payload: dict) -> dict | None:
+            received.append(payload)
+            return None
+
+        hub.add_pending("alice", "coder", {
+            "invocation_id": "inv-401-2",
+            "method": "tasks/send",
+            "params": {},
+        })
+
+        watcher = SSEWatcher(
+            krewhub_url=base_url,
+            jwt_token="stale-token",
+            owner="alice",
+            agent_names=["coder"],
+            on_invocation=on_invocation,
+        )
+
+        await watcher.poll_pending()
+
+        assert hub.unauthorized_hits == 1
+        assert received == [], "no reloader → request should stay unauthorized"
+
+    async def test_reloader_returning_same_token_does_not_retry(self, fake_hub):
+        hub, base_url = fake_hub
+        hub.required_token = "new-token"
+
+        received = []
+
+        async def on_invocation(payload: dict) -> dict | None:
+            received.append(payload)
+            return None
+
+        hub.add_pending("alice", "coder", {
+            "invocation_id": "inv-401-3",
+            "method": "tasks/send",
+            "params": {},
+        })
+
+        # Reloader keeps returning the same stale token (disk wasn't updated).
+        watcher = SSEWatcher(
+            krewhub_url=base_url,
+            jwt_token="stale-token",
+            owner="alice",
+            agent_names=["coder"],
+            on_invocation=on_invocation,
+            token_reloader=lambda: "stale-token",
+        )
+
+        await watcher.poll_pending()
+
+        # Only one 401: we don't retry when reloader offers nothing new.
+        assert hub.unauthorized_hits == 1
+        assert received == []

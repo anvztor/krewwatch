@@ -30,18 +30,38 @@ class SSEWatcher:
         agent_names: list[str],
         on_invocation: Callable[[dict], Awaitable[dict | None]],
         poll_interval: float = 5.0,
+        token_reloader: Callable[[], str | None] | None = None,
     ):
+        """Args:
+            token_reloader: optional zero-arg callable invoked on 401 to
+                fetch a fresh JWT (e.g. from a disk cache). Returning None
+                or the same token is treated as "no refresh available" and
+                the request is abandoned. Long-running daemons use this to
+                recover from token rotation without a restart.
+        """
         self._krewhub_url = krewhub_url
         self._jwt_token = jwt_token
         self._owner = owner
         self._agent_names = set(agent_names)
         self._on_invocation = on_invocation
         self._poll_interval = poll_interval
+        self._token_reloader = token_reloader
         self._running = False
         self._poll_task: asyncio.Task | None = None
         self._sse_task: asyncio.Task | None = None
         self._processed: set[str] = set()  # dedup invocation ids
         self._last_seq = 0
+
+    def _maybe_refresh_token(self) -> bool:
+        """Reload the JWT from the registered reloader. Returns True on refresh."""
+        if self._token_reloader is None:
+            return False
+        fresh = self._token_reloader()
+        if not fresh or fresh == self._jwt_token:
+            return False
+        logger.warning("krewhub returned 401; JWT refreshed from reloader")
+        self._jwt_token = fresh
+        return True
 
     def start(self) -> None:
         self._running = True
@@ -82,6 +102,11 @@ class SSEWatcher:
                         f"{self._krewhub_url}/a2a/{self._owner}/{agent_name}/pending",
                         headers={"Authorization": f"Bearer {self._jwt_token}"},
                     )
+                    if resp.status_code == 401 and self._maybe_refresh_token():
+                        resp = await client.get(
+                            f"{self._krewhub_url}/a2a/{self._owner}/{agent_name}/pending",
+                            headers={"Authorization": f"Bearer {self._jwt_token}"},
+                        )
                     if resp.status_code != 200:
                         continue
 
@@ -120,10 +145,13 @@ class SSEWatcher:
 
     async def _sse_once(self) -> None:
         url = f"{self._krewhub_url}/api/v1/watch?since={self._last_seq}"
-        headers = {"Authorization": f"Bearer {self._jwt_token}"}
 
         async with httpx.AsyncClient(timeout=None) as client:
+            headers = {"Authorization": f"Bearer {self._jwt_token}"}
             async with client.stream("GET", url, headers=headers) as resp:
+                if resp.status_code == 401 and self._maybe_refresh_token():
+                    await asyncio.sleep(1)
+                    return
                 if resp.status_code != 200:
                     logger.debug("SSE connect failed: %d", resp.status_code)
                     await asyncio.sleep(10)

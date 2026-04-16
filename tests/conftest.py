@@ -30,6 +30,10 @@ class FakeHub:
         self.responses: list[dict] = []
         self._waiters: list[asyncio.Event] = []
         self._seq = 0
+        # When set, requests whose Authorization header doesn't end with this
+        # token receive a 401. Lets tests exercise refresh-on-401 behavior.
+        self.required_token: str | None = None
+        self.unauthorized_hits: int = 0
 
     def push_event(self, event: dict[str, Any]) -> None:
         self._seq += 1
@@ -42,10 +46,22 @@ class FakeHub:
         key = f"{owner}/{agent}"
         self.pending_invocations.setdefault(key, []).append(invocation)
 
+    def _check_auth(self, request: Request) -> JSONResponse | None:
+        if self.required_token is None:
+            return None
+        auth = request.headers.get("authorization", "")
+        if auth != f"Bearer {self.required_token}":
+            self.unauthorized_hits += 1
+            return JSONResponse({"detail": "Missing or invalid credentials"}, status_code=401)
+        return None
+
     def build_app(self) -> Starlette:
         hub = self
 
-        async def watch_sse(request: Request) -> StreamingResponse:
+        async def watch_sse(request: Request):
+            err = hub._check_auth(request)
+            if err is not None:
+                return err
             since = int(request.query_params.get("since", "0"))
 
             async def stream() -> AsyncIterator[str]:
@@ -70,6 +86,9 @@ class FakeHub:
             return StreamingResponse(stream(), media_type="text/event-stream")
 
         async def pending(request: Request) -> JSONResponse:
+            err = hub._check_auth(request)
+            if err is not None:
+                return err
             owner = request.path_params["owner"]
             agent = request.path_params["agent"]
             key = f"{owner}/{agent}"
