@@ -31,6 +31,7 @@ class SSEWatcher:
         on_invocation: Callable[[dict], Awaitable[dict | None]],
         poll_interval: float = 5.0,
         token_reloader: Callable[[], str | None] | None = None,
+        max_concurrent_invocations: int = 5,
     ):
         """Args:
             token_reloader: optional zero-arg callable invoked on 401 to
@@ -38,6 +39,13 @@ class SSEWatcher:
                 or the same token is treated as "no refresh available" and
                 the request is abandoned. Long-running daemons use this to
                 recover from token rotation without a restart.
+            max_concurrent_invocations: cap on parallel ``on_invocation``
+                calls. Before this was added the watcher dispatched
+                invocations strictly serially in ``_poll_once`` /
+                ``_sse_once``, so a 30-minute task would block every
+                subsequent invocation for 30 minutes — leaving freshly
+                dispatched tasks visibly stuck in `claimed` while the
+                hub still held them in the pending queue.
         """
         self._krewhub_url = krewhub_url
         self._jwt_token = jwt_token
@@ -51,6 +59,11 @@ class SSEWatcher:
         self._sse_task: asyncio.Task | None = None
         self._processed: set[str] = set()  # dedup invocation ids
         self._last_seq = 0
+        # Bounded concurrency for invocation dispatch. The semaphore
+        # guards the actual work; _handle_event itself stays cheap so
+        # poll/sse loops keep moving.
+        self._concurrency = asyncio.Semaphore(max_concurrent_invocations)
+        self._inflight: set[asyncio.Task] = set()
 
     def _maybe_refresh_token(self) -> bool:
         """Reload the JWT from the registered reloader. Returns True on refresh."""
@@ -78,6 +91,11 @@ class SSEWatcher:
                     await task
                 except asyncio.CancelledError:
                     pass
+        # Drain in-flight invocation handlers so we don't leave
+        # _on_invocation futures dangling on shutdown.
+        if self._inflight:
+            logger.info("SSE watcher draining %d in-flight invocations", len(self._inflight))
+            await asyncio.gather(*self._inflight, return_exceptions=True)
         logger.info("SSE watcher stopped")
 
     # ------------------------------------------------------------------
@@ -128,6 +146,17 @@ class SSEWatcher:
     # Expose for one-shot startup call
     async def poll_pending(self) -> None:
         await self._poll_once()
+
+    async def wait_inflight(self) -> None:
+        """Block until every spawned invocation handler has completed.
+
+        Used by tests + graceful-shutdown paths to assert "no work in
+        flight" before checking response state. Production runs leave
+        invocations running concurrently — this is a deliberate join
+        point, not an opportunistic flush.
+        """
+        if self._inflight:
+            await asyncio.gather(*self._inflight, return_exceptions=True)
 
     # ------------------------------------------------------------------
     # Secondary: SSE live stream (best-effort, faster delivery)
@@ -188,6 +217,10 @@ class SSEWatcher:
     # ------------------------------------------------------------------
 
     async def _handle_event(self, payload: dict) -> None:
+        """Validate + dedup the event, then spawn the dispatch as a
+        fire-and-forget task. Returns quickly so the poll/sse loops
+        keep moving even when individual invocations run for many
+        minutes."""
         agent_name = payload.get("agent_name")
         owner = payload.get("owner")
         invocation_id = payload.get("id")
@@ -199,6 +232,9 @@ class SSEWatcher:
         if invocation_id in self._processed:
             return
 
+        # Mark processed BEFORE spawning the handler so a near-
+        # simultaneous SSE/poll arrival of the same invocation
+        # doesn't double-fire while the handler awaits the semaphore.
         self._processed.add(invocation_id)
         # Cap dedup set size
         if len(self._processed) > 1000:
@@ -206,28 +242,47 @@ class SSEWatcher:
 
         logger.info("A2A invocation: %s for %s/%s", invocation_id, owner, agent_name)
 
-        try:
-            result = await self._on_invocation(payload)
+        # Fire-and-forget the dispatch under a bounded semaphore so up
+        # to ``max_concurrent_invocations`` runs in parallel. Without
+        # this the poll loop blocked on the FULL execution of each
+        # invocation — a long task held the queue closed for the
+        # duration of its run, leaving subsequent tasks stuck in
+        # `claimed` from the hub side.
+        task = asyncio.create_task(
+            self._run_invocation(payload, invocation_id),
+            name=f"sse-invocation:{invocation_id}",
+        )
+        self._inflight.add(task)
+        task.add_done_callback(self._inflight.discard)
 
-            async with httpx.AsyncClient(timeout=60) as client:
-                resp = await client.post(
-                    f"{self._krewhub_url}/a2a/respond",
-                    json={"invocation_id": invocation_id, "result": result},
-                    headers={"Authorization": f"Bearer {self._jwt_token}"},
-                )
-                if resp.status_code == 200:
-                    logger.info("A2A response posted for %s", invocation_id)
-                else:
-                    logger.error("A2A response failed: %d %s", resp.status_code, resp.text[:200])
-
-        except Exception as e:
-            logger.exception("A2A invocation %s failed: %s", invocation_id, e)
+    async def _run_invocation(self, payload: dict, invocation_id: str) -> None:
+        """The actual dispatch + respond. Bounded by ``self._concurrency``."""
+        async with self._concurrency:
             try:
-                async with httpx.AsyncClient(timeout=10) as client:
-                    await client.post(
+                result = await self._on_invocation(payload)
+
+                async with httpx.AsyncClient(timeout=60) as client:
+                    resp = await client.post(
                         f"{self._krewhub_url}/a2a/respond",
-                        json={"invocation_id": invocation_id, "error": str(e)},
+                        json={"invocation_id": invocation_id, "result": result},
                         headers={"Authorization": f"Bearer {self._jwt_token}"},
                     )
-            except Exception:
-                pass
+                    if resp.status_code == 200:
+                        logger.info("A2A response posted for %s", invocation_id)
+                    else:
+                        logger.error(
+                            "A2A response failed: %d %s",
+                            resp.status_code, resp.text[:200],
+                        )
+
+            except Exception as e:
+                logger.exception("A2A invocation %s failed: %s", invocation_id, e)
+                try:
+                    async with httpx.AsyncClient(timeout=10) as client:
+                        await client.post(
+                            f"{self._krewhub_url}/a2a/respond",
+                            json={"invocation_id": invocation_id, "error": str(e)},
+                            headers={"Authorization": f"Bearer {self._jwt_token}"},
+                        )
+                except Exception:
+                    pass

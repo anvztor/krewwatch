@@ -61,6 +61,7 @@ class TestSSEWatcherPoll:
         )
 
         await watcher.poll_pending()
+        await watcher.wait_inflight()
 
         assert len(hub.responses) == 1
         assert hub.responses[0]["invocation_id"] == "inv-002"
@@ -87,10 +88,111 @@ class TestSSEWatcherPoll:
         )
 
         await watcher.poll_pending()
+        await watcher.wait_inflight()
 
         assert len(hub.responses) == 1
         assert "error" in hub.responses[0]
         assert "agent crashed" in hub.responses[0]["error"]
+
+
+class TestSSEWatcherConcurrency:
+    """Bug history: poll/sse loops awaited each invocation's full
+    handler before processing the next event. A long-running task
+    blocked subsequent invocations for its entire duration, leaving
+    freshly dispatched tasks visibly stuck in `claimed` state from
+    the krewhub side. Dispatch is now fire-and-forget under a
+    bounded semaphore.
+    """
+
+    async def test_long_invocation_does_not_block_next_poll(self, fake_hub):
+        import asyncio
+        hub, base_url = fake_hub
+
+        slow_started = asyncio.Event()
+        slow_release = asyncio.Event()
+
+        async def on_invocation(payload):
+            inv_id = payload["id"]
+            if inv_id == "inv-slow":
+                slow_started.set()
+                await slow_release.wait()
+                return {"text": "slow done"}
+            return {"text": "fast done"}
+
+        hub.add_pending("alice", "coder", {
+            "invocation_id": "inv-slow",
+            "method": "tasks/send", "params": {},
+        })
+        hub.add_pending("alice", "coder", {
+            "invocation_id": "inv-fast",
+            "method": "tasks/send", "params": {},
+        })
+
+        watcher = SSEWatcher(
+            krewhub_url=base_url, jwt_token="test-jwt",
+            owner="alice", agent_names=["coder"],
+            on_invocation=on_invocation,
+            max_concurrent_invocations=4,
+        )
+
+        # poll_pending iterates both pendings; with the concurrency
+        # fix, _handle_event spawns each as a task and returns
+        # immediately, so this should NOT block on the slow handler.
+        await asyncio.wait_for(watcher.poll_pending(), timeout=1.0)
+
+        # The slow invocation should have started…
+        await asyncio.wait_for(slow_started.wait(), timeout=1.0)
+        # …and the fast one should be able to complete in parallel.
+        for _ in range(50):
+            if any(r.get("invocation_id") == "inv-fast" for r in hub.responses):
+                break
+            await asyncio.sleep(0.05)
+        fast_done = [r for r in hub.responses if r.get("invocation_id") == "inv-fast"]
+        assert fast_done, "fast invocation must complete while slow is still in-flight"
+
+        # Release the slow one + drain.
+        slow_release.set()
+        await watcher.wait_inflight()
+        assert any(r.get("invocation_id") == "inv-slow" for r in hub.responses)
+
+    async def test_max_concurrent_invocations_caps_parallelism(self, fake_hub):
+        import asyncio
+        hub, base_url = fake_hub
+
+        running = 0
+        peak = 0
+        gate = asyncio.Event()
+
+        async def on_invocation(payload):
+            nonlocal running, peak
+            running += 1
+            peak = max(peak, running)
+            try:
+                await gate.wait()
+                return {"text": "ok"}
+            finally:
+                running -= 1
+
+        for i in range(5):
+            hub.add_pending("alice", "coder", {
+                "invocation_id": f"inv-{i}",
+                "method": "tasks/send", "params": {},
+            })
+
+        watcher = SSEWatcher(
+            krewhub_url=base_url, jwt_token="test-jwt",
+            owner="alice", agent_names=["coder"],
+            on_invocation=on_invocation,
+            max_concurrent_invocations=2,
+        )
+        await watcher.poll_pending()
+        # Give scheduler time to start the parallel-eligible handlers.
+        await asyncio.sleep(0.1)
+        assert peak == 2, f"expected peak concurrency of 2, got {peak}"
+
+        gate.set()
+        await watcher.wait_inflight()
+        assert len(hub.responses) == 5
 
 
 class TestSSEWatcherDedup:
