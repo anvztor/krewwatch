@@ -236,27 +236,29 @@ class TestProdCookrewBFFProxy:
 
     async def test_cookrew_watch_bff_streams_sse(self):
         """Verify the BFF watch route proxies SSE from krewhub."""
-        # Discover a real recipe_id from production
-        recipe_id = None
+        # Discover a real cookbook_id from production
+        cookbook_id = None
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             resp = await client.get(
-                f"{KREWHUB_URL}/api/v1/recipes",
+                f"{KREWHUB_URL}/api/v1/cookbooks",
                 headers={"X-API-Key": API_KEY},
             )
             if resp.status_code == 200:
                 data = resp.json()
-                recipes = data if isinstance(data, list) else data.get("recipes", [])
-                if recipes:
-                    recipe_id = recipes[0].get("id")
+                cookbooks = (
+                    data if isinstance(data, list) else data.get("cookbooks", [])
+                )
+                if cookbooks:
+                    cookbook_id = cookbooks[0].get("id")
 
-        if not recipe_id:
-            pytest.skip("No recipes found in production")
+        if not cookbook_id:
+            pytest.skip("No cookbooks found in production")
 
         # Test BFF watch route with streaming client
         async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
             async with client.stream(
                 "GET",
-                f"{COOKREW_URL}/api/recipes/{recipe_id}/watch?since=0",
+                f"{COOKREW_URL}/api/cookbooks/{cookbook_id}/watch?since=0",
             ) as resp:
                 # 200 means SSE is streaming, 502 means upstream unreachable
                 assert resp.status_code in (200, 502), (

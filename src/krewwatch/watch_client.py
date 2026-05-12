@@ -36,13 +36,13 @@ class WatchClient:
         api_key: str,
         *,
         resource_type: str | None = None,
-        recipe_id: str | None = None,
+        cookbook_id: str | None = None,
         reconnect_delay: float = 2.0,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._resource_type = resource_type
-        self._recipe_id = recipe_id
+        self._cookbook_id = cookbook_id
         self._reconnect_delay = reconnect_delay
         self._last_seq = 0
         self._running = False
@@ -93,8 +93,8 @@ class WatchClient:
         params: dict[str, str] = {"since": str(self._last_seq)}
         if self._resource_type:
             params["resource_type"] = self._resource_type
-        if self._recipe_id:
-            params["recipe_id"] = self._recipe_id
+        if self._cookbook_id:
+            params["cookbook_id"] = self._cookbook_id
 
         url = f"{self._base_url}/api/v1/watch"
         headers = {"X-API-Key": self._api_key}
